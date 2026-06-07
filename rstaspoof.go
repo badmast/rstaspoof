@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	Version            = "3.5.0"
+	Version            = "4.0.0"
 	EthPIP             = 0x0800
 	EthPAll            = 0x0003
 	IPPROTOTCP         = 6
@@ -30,13 +30,13 @@ const (
 	RST                = 0x04
 	PSH                = 0x08
 	ACK                = 0x10
-	BufferSize         = 131072
+	BufferSize         = 1 << 20
 	FailoverThreshold  = 3
 	FailoverWindow     = 30.0
-	MaxConcurrentConns = 8192
-	DataLogInterval    = 65536
-	TCPReadBuffer      = 524288
-	TCPWriteBuffer     = 524288
+	MaxConcurrentConns = 32768
+	DataLogInterval    = 262144
+	TCPReadBuffer      = 4 << 20
+	TCPWriteBuffer     = 4 << 20
 )
 
 var bufPool = sync.Pool{
@@ -64,21 +64,25 @@ func init() {
 	}
 }
 
-func colorize(code, text string) string {
+type colorizer struct{}
+
+func (c colorizer) code(code, text string) string {
 	if colorEnabled {
 		return "\033[" + code + "m" + text + "\033[0m"
 	}
 	return text
 }
 
-func green(t string) string   { return colorize("92", t) }
-func red(t string) string     { return colorize("91", t) }
-func yellow(t string) string  { return colorize("93", t) }
-func cyan(t string) string    { return colorize("96", t) }
-func blue(t string) string    { return colorize("94", t) }
-func magenta(t string) string { return colorize("95", t) }
-func bold(t string) string    { return colorize("1", t) }
-func dim(t string) string     { return colorize("2", t) }
+var clr = colorizer{}
+
+func green(t string) string   { return clr.code("92", t) }
+func red(t string) string     { return clr.code("91", t) }
+func yellow(t string) string  { return clr.code("93", t) }
+func cyan(t string) string    { return clr.code("96", t) }
+func blue(t string) string    { return clr.code("94", t) }
+func magenta(t string) string { return clr.code("95", t) }
+func bold(t string) string    { return clr.code("1", t) }
+func dim(t string) string     { return clr.code("2", t) }
 
 const (
 	EvConnOpen       = "CONN_OPEN"
@@ -162,26 +166,56 @@ func drawFragmentBar(sizes []int) {
 	fmt.Printf("  %s%s  %s\n", dim("TLS:"), bar, strings.Join(labels, " "))
 }
 
-type PacketMonitor struct {
-	mu           sync.RWMutex
-	conns        map[string]*ConnState
-	maxConns     int
-	quiet        bool
+type MonitorState struct {
+	conns     map[string]*ConnState
+	connOrder []string
+	maxConns  int
+}
+
+func newMonitorState(maxConns int) *MonitorState {
+	return &MonitorState{
+		conns:    make(map[string]*ConnState, maxConns),
+		maxConns: maxConns,
+	}
+}
+
+func (s *MonitorState) addConn(cid string, cs *ConnState) {
+	s.conns[cid] = cs
+	s.connOrder = append(s.connOrder, cid)
+	for len(s.connOrder) > s.maxConns {
+		oldest := s.connOrder[0]
+		s.connOrder = s.connOrder[1:]
+		delete(s.conns, oldest)
+	}
+}
+
+type MonitorCounters struct {
 	totalConns   int64
 	totalBlocked int64
 	totalOK      int64
 	totalC2S     int64
 	totalS2C     int64
-	startTime    time.Time
-	connOrder    []string
+}
+
+func (c *MonitorCounters) addConn()    { atomic.AddInt64(&c.totalConns, 1) }
+func (c *MonitorCounters) addOK()     { atomic.AddInt64(&c.totalOK, 1) }
+func (c *MonitorCounters) addBlocked() { atomic.AddInt64(&c.totalBlocked, 1) }
+func (c *MonitorCounters) addC2S(n int64) { atomic.AddInt64(&c.totalC2S, n) }
+func (c *MonitorCounters) addS2C(n int64) { atomic.AddInt64(&c.totalS2C, n) }
+
+type PacketMonitor struct {
+	mu       sync.RWMutex
+	state    *MonitorState
+	counters MonitorCounters
+	quiet    bool
+	start    time.Time
 }
 
 func NewPacketMonitor(maxConns int, quiet bool) *PacketMonitor {
 	return &PacketMonitor{
-		conns:     make(map[string]*ConnState),
-		maxConns:  maxConns,
-		quiet:     quiet,
-		startTime: time.Now(),
+		state: newMonitorState(maxConns),
+		quiet: quiet,
+		start: time.Now(),
 	}
 }
 
@@ -196,11 +230,11 @@ func (m *PacketMonitor) Emit(ev PacketEvent) {
 
 func (m *PacketMonitor) apply(ev PacketEvent) {
 	cid := ev.ConnID
-	cs := m.conns[cid]
+	cs := m.state.conns[cid]
 
 	switch ev.Event {
 	case EvConnOpen:
-		atomic.AddInt64(&m.totalConns, 1)
+		m.counters.addConn()
 		cs = &ConnState{
 			ConnID:     cid,
 			ClientAddr: strVal(ev.Data, "client"),
@@ -210,13 +244,7 @@ func (m *PacketMonitor) apply(ev PacketEvent) {
 			Status:     "connecting",
 			StartTime:  time.Now(),
 		}
-		m.conns[cid] = cs
-		m.connOrder = append(m.connOrder, cid)
-		for len(m.connOrder) > m.maxConns {
-			oldest := m.connOrder[0]
-			m.connOrder = m.connOrder[1:]
-			delete(m.conns, oldest)
-		}
+		m.state.addConn(cid, cs)
 		return
 	}
 
@@ -237,20 +265,20 @@ func (m *PacketMonitor) apply(ev PacketEvent) {
 	case EvServerResponse:
 		cs.ServerReplied = true
 		cs.Status = "active"
-		atomic.AddInt64(&m.totalOK, 1)
+		m.counters.addOK()
 	case EvDPIBlocked:
 		cs.Status = "blocked"
-		atomic.AddInt64(&m.totalBlocked, 1)
+		m.counters.addBlocked()
 	case EvDPIBypassOK:
 		cs.Status = "active"
 	case EvDataC2S:
 		n := int64(toInt(ev.Data["bytes"]))
 		atomic.AddInt64(&cs.BytesC2S, n)
-		atomic.AddInt64(&m.totalC2S, n)
+		m.counters.addC2S(n)
 	case EvDataS2C:
 		n := int64(toInt(ev.Data["bytes"]))
 		atomic.AddInt64(&cs.BytesS2C, n)
-		atomic.AddInt64(&m.totalS2C, n)
+		m.counters.addS2C(n)
 	case EvConnClose:
 		cs.Status = "closed"
 		cs.EndTime = time.Now()
@@ -268,7 +296,7 @@ func (m *PacketMonitor) printEvent(ev PacketEvent) {
 	ts := time.Now().Format("15:04:05")
 
 	m.mu.RLock()
-	cs := m.conns[ev.ConnID]
+	cs := m.state.conns[ev.ConnID]
 	m.mu.RUnlock()
 
 	tag := func(label string, cf func(string) string) string {
@@ -385,18 +413,18 @@ func (m *PacketMonitor) printEvent(ev PacketEvent) {
 }
 
 func (m *PacketMonitor) PrintStats() {
-	uptime := time.Since(m.startTime).Seconds()
+	uptime := time.Since(m.start).Seconds()
 	m.mu.RLock()
 	active := 0
-	for _, c := range m.conns {
+	for _, c := range m.state.conns {
 		if c.Status == "connecting" || c.Status == "active" {
 			active++
 		}
 	}
 	m.mu.RUnlock()
 
-	ok := atomic.LoadInt64(&m.totalOK)
-	blocked := atomic.LoadInt64(&m.totalBlocked)
+	ok := atomic.LoadInt64(&m.counters.totalOK)
+	blocked := atomic.LoadInt64(&m.counters.totalBlocked)
 	total := ok + blocked
 	spoofRate := 0
 	if total > 0 {
@@ -409,14 +437,14 @@ func (m *PacketMonitor) PrintStats() {
 	fmt.Printf("%s\n", strings.Repeat("─", 66))
 	fmt.Printf("  %-20s total=%-6s  active=%-6s  blocked=%-6s  ok=%s\n",
 		"connections",
-		cyan(fmt.Sprintf("%d", atomic.LoadInt64(&m.totalConns))),
+		cyan(fmt.Sprintf("%d", atomic.LoadInt64(&m.counters.totalConns))),
 		green(fmt.Sprintf("%d", active)),
 		red(fmt.Sprintf("%d", blocked)),
 		green(fmt.Sprintf("%d", ok)))
 	fmt.Printf("  %-20s %s success rate\n", "SNI spoof", green(fmt.Sprintf("%d%%", spoofRate)))
 	fmt.Printf("  %-20s ↑%s  ↓%s\n", "traffic",
-		fmtBytes(atomic.LoadInt64(&m.totalC2S)),
-		fmtBytes(atomic.LoadInt64(&m.totalS2C)))
+		fmtBytes(atomic.LoadInt64(&m.counters.totalC2S)),
+		fmtBytes(atomic.LoadInt64(&m.counters.totalS2C)))
 	fmt.Printf("%s\n", bold(strings.Repeat("═", 66)))
 }
 
@@ -462,9 +490,9 @@ var (
 	pskKeyExchange, _       = hex.DecodeString("002d" + "0002" + "0101")
 )
 
-type ClientHelloBuilder struct{}
+type TLSExtensionBuilder struct{}
 
-func (ClientHelloBuilder) BuildSNIExtension(sni string) []byte {
+func (TLSExtensionBuilder) buildSNI(sni string) []byte {
 	sniBytes := []byte(sni)
 	entry := make([]byte, 3+len(sniBytes))
 	entry[0] = 0
@@ -480,7 +508,7 @@ func (ClientHelloBuilder) BuildSNIExtension(sni string) []byte {
 	return result
 }
 
-func (ClientHelloBuilder) BuildKeyShareExtension(publicKey []byte) []byte {
+func (TLSExtensionBuilder) buildKeyShare(publicKey []byte) []byte {
 	if publicKey == nil {
 		publicKey = make([]byte, 32)
 		rand.Read(publicKey)
@@ -499,7 +527,7 @@ func (ClientHelloBuilder) BuildKeyShareExtension(publicKey []byte) []byte {
 	return result
 }
 
-func (ClientHelloBuilder) BuildPaddingExtension(targetLength, currentLength int) []byte {
+func (TLSExtensionBuilder) buildPadding(targetLength, currentLength int) []byte {
 	paddingNeeded := targetLength - currentLength - 4
 	if paddingNeeded < 0 {
 		return nil
@@ -508,6 +536,22 @@ func (ClientHelloBuilder) BuildPaddingExtension(targetLength, currentLength int)
 	binary.BigEndian.PutUint16(result, 0x0015)
 	binary.BigEndian.PutUint16(result[2:], uint16(paddingNeeded))
 	return result
+}
+
+type ClientHelloBuilder struct {
+	ext TLSExtensionBuilder
+}
+
+func (b ClientHelloBuilder) BuildSNIExtension(sni string) []byte {
+	return b.ext.buildSNI(sni)
+}
+
+func (b ClientHelloBuilder) BuildKeyShareExtension(publicKey []byte) []byte {
+	return b.ext.buildKeyShare(publicKey)
+}
+
+func (b ClientHelloBuilder) BuildPaddingExtension(targetLength, currentLength int) []byte {
+	return b.ext.buildPadding(targetLength, currentLength)
 }
 
 func (b ClientHelloBuilder) BuildClientHello(sni string, sessionID, randomBytes, keyShare []byte, targetSize int) []byte {
@@ -565,7 +609,7 @@ func (b ClientHelloBuilder) BuildClientHello(sni string, sessionID, randomBytes,
 	return record
 }
 
-func (ClientHelloBuilder) ParseClientHello(data []byte) map[string]interface{} {
+func (b ClientHelloBuilder) ParseClientHello(data []byte) map[string]interface{} {
 	result := make(map[string]interface{})
 	if len(data) < 5 {
 		return result
@@ -633,25 +677,27 @@ func (ClientHelloBuilder) ParseClientHello(data []byte) map[string]interface{} {
 	return result
 }
 
-func fragmentClientHello(data []byte, strategy string) [][]byte {
+type FragmentEngine struct{}
+
+func (FragmentEngine) Fragment(data []byte, strategy string) [][]byte {
 	if strategy == "none" || len(data) < 10 {
 		return [][]byte{data}
 	}
 	switch strategy {
 	case "sni_split":
-		return fragmentAtSNI(data)
+		return FragmentEngine{}.atSNI(data)
 	case "half":
 		mid := len(data) / 2
 		return [][]byte{data[:mid], data[mid:]}
 	case "multi":
-		return fragmentMulti(data, 24)
+		return FragmentEngine{}.multi(data, 24)
 	case "tls_record_frag":
-		return tlsRecordFragment(data)
+		return FragmentEngine{}.tlsRecord(data)
 	}
 	return [][]byte{data}
 }
 
-func findSNIOffset(data []byte) (int, int) {
+func (FragmentEngine) findSNIOffset(data []byte) (int, int) {
 	for pos := 0; pos < len(data)-10; pos++ {
 		if data[pos] == 0x00 && data[pos+1] == 0x00 {
 			if pos+9 >= len(data) {
@@ -689,8 +735,8 @@ func findSNIOffset(data []byte) (int, int) {
 	return -1, 0
 }
 
-func fragmentAtSNI(data []byte) [][]byte {
-	sniOffset, sniLen := findSNIOffset(data)
+func (e FragmentEngine) atSNI(data []byte) [][]byte {
+	sniOffset, sniLen := e.findSNIOffset(data)
 	if sniOffset < 0 {
 		mid := len(data) / 2
 		return [][]byte{data[:mid], data[mid:]}
@@ -699,7 +745,7 @@ func fragmentAtSNI(data []byte) [][]byte {
 	return [][]byte{data[:splitPoint], data[splitPoint:]}
 }
 
-func fragmentMulti(data []byte, chunkSize int) [][]byte {
+func (FragmentEngine) multi(data []byte, chunkSize int) [][]byte {
 	var result [][]byte
 	for i := 0; i < len(data); i += chunkSize {
 		end := i + chunkSize
@@ -711,7 +757,7 @@ func fragmentMulti(data []byte, chunkSize int) [][]byte {
 	return result
 }
 
-func tlsRecordFragment(data []byte) [][]byte {
+func (FragmentEngine) tlsRecord(data []byte) [][]byte {
 	if len(data) < 6 || data[0] != 0x16 {
 		return [][]byte{data}
 	}
@@ -733,6 +779,10 @@ func tlsRecordFragment(data []byte) [][]byte {
 	return [][]byte{record1, record2}
 }
 
+func fragmentClientHello(data []byte, strategy string) [][]byte {
+	return FragmentEngine{}.Fragment(data, strategy)
+}
+
 type BypassStrategy interface {
 	Name() string
 	Apply(clientConn, serverConn net.Conn, fakeSNI string, firstData []byte) bool
@@ -742,6 +792,7 @@ type FragmentBypass struct {
 	strategy      string
 	fragmentDelay float64
 	tcpNoDelay    bool
+	engine        FragmentEngine
 }
 
 func NewFragmentBypass(strategy string, fragmentDelay float64, tcpNoDelay bool) *FragmentBypass {
@@ -759,7 +810,7 @@ func (f *FragmentBypass) Apply(clientConn, serverConn net.Conn, fakeSNI string, 
 	if ok && f.tcpNoDelay {
 		tc.SetNoDelay(true)
 	}
-	fragments := fragmentClientHello(firstData, f.strategy)
+	fragments := f.engine.Fragment(firstData, f.strategy)
 	for i, frag := range fragments {
 		_, err := serverConn.Write(frag)
 		if err != nil {
@@ -780,6 +831,8 @@ type FakeSNIBypass struct {
 	useTTLTrick      bool
 	fragmentReal     bool
 	fragmentStrategy string
+	engine           FragmentEngine
+	builder          ClientHelloBuilder
 }
 
 func NewFakeSNIBypass(method string, useTTLTrick, fragmentReal bool, fragmentStrategy string) *FakeSNIBypass {
@@ -800,14 +853,8 @@ func (f *FakeSNIBypass) Apply(clientConn, serverConn net.Conn, fakeSNI string, f
 	return f.fragmentFallback(serverConn, firstData)
 }
 
-func (f *FakeSNIBypass) ttlTrickAndFragment(serverConn net.Conn, fakeSNI string, firstData []byte) bool {
-	tc, ok := serverConn.(*net.TCPConn)
-	if ok {
-		tc.SetNoDelay(true)
-	}
-	remoteAddr := serverConn.RemoteAddr().String()
-	b := ClientHelloBuilder{}
-	fakeHello := b.BuildClientHello(fakeSNI, nil, nil, nil, 517)
+func (f *FakeSNIBypass) sendFakeHello(remoteAddr, fakeSNI string) {
+	fakeHello := f.builder.BuildClientHello(fakeSNI, nil, nil, nil, 517)
 	for i := 0; i < 3; i++ {
 		probe, err := net.DialTimeout("tcp", remoteAddr, 300*time.Millisecond)
 		if err == nil {
@@ -816,8 +863,16 @@ func (f *FakeSNIBypass) ttlTrickAndFragment(serverConn net.Conn, fakeSNI string,
 			break
 		}
 	}
+}
+
+func (f *FakeSNIBypass) ttlTrickAndFragment(serverConn net.Conn, fakeSNI string, firstData []byte) bool {
+	tc, ok := serverConn.(*net.TCPConn)
+	if ok {
+		tc.SetNoDelay(true)
+	}
+	f.sendFakeHello(serverConn.RemoteAddr().String(), fakeSNI)
 	time.Sleep(50 * time.Millisecond)
-	fragments := fragmentClientHello(firstData, "sni_split")
+	fragments := f.engine.Fragment(firstData, "sni_split")
 	for i, frag := range fragments {
 		_, err := serverConn.Write(frag)
 		if err != nil {
@@ -838,7 +893,7 @@ func (f *FakeSNIBypass) fragmentFallback(serverConn net.Conn, firstData []byte) 
 	if ok {
 		tc.SetNoDelay(true)
 	}
-	fragments := fragmentClientHello(firstData, "sni_split")
+	fragments := f.engine.Fragment(firstData, "sni_split")
 	for i, frag := range fragments {
 		_, err := serverConn.Write(frag)
 		if err != nil {
@@ -859,6 +914,8 @@ type CombinedBypass struct {
 	useTTLTrick      bool
 	fragmentDelay    float64
 	fakeFirst        bool
+	engine           FragmentEngine
+	builder          ClientHelloBuilder
 }
 
 func NewCombinedBypass(fragmentStrategy string, useTTLTrick bool, fragmentDelay float64, fakeFirst bool) *CombinedBypass {
@@ -879,8 +936,7 @@ func (cb *CombinedBypass) Apply(clientConn, serverConn net.Conn, fakeSNI string,
 	}
 	if cb.fakeFirst && cb.useTTLTrick {
 		remoteAddr := serverConn.RemoteAddr().String()
-		b := ClientHelloBuilder{}
-		fakeHello := b.BuildClientHello(fakeSNI, nil, nil, nil, 517)
+		fakeHello := cb.builder.BuildClientHello(fakeSNI, nil, nil, nil, 517)
 		for i := 0; i < 3; i++ {
 			probe, err := net.DialTimeout("tcp", remoteAddr, 300*time.Millisecond)
 			if err == nil {
@@ -891,7 +947,7 @@ func (cb *CombinedBypass) Apply(clientConn, serverConn net.Conn, fakeSNI string,
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	fragments := fragmentClientHello(firstData, cb.fragmentStrategy)
+	fragments := cb.engine.Fragment(firstData, cb.fragmentStrategy)
 	for i, frag := range fragments {
 		_, err := serverConn.Write(frag)
 		if err != nil {
@@ -907,15 +963,29 @@ func (cb *CombinedBypass) Apply(clientConn, serverConn net.Conn, fakeSNI string,
 	return true
 }
 
+type FailRecord struct {
+	times []time.Time
+}
+
+func (r *FailRecord) prune(cutoff time.Time) {
+	filtered := r.times[:0]
+	for _, t := range r.times {
+		if t.After(cutoff) {
+			filtered = append(filtered, t)
+		}
+	}
+	r.times = filtered
+}
+
 type ConnectionTracker struct {
 	mu       sync.Mutex
-	failures map[string][]time.Time
+	failures map[string]*FailRecord
 	success  map[string]int
 }
 
 func NewConnectionTracker() *ConnectionTracker {
 	return &ConnectionTracker{
-		failures: make(map[string][]time.Time),
+		failures: make(map[string]*FailRecord),
 		success:  make(map[string]int),
 	}
 }
@@ -926,17 +996,12 @@ func (ct *ConnectionTracker) RecordFailure(ip string) int {
 	now := time.Now()
 	cutoff := now.Add(-FailoverWindow * time.Second)
 	if ct.failures[ip] == nil {
-		ct.failures[ip] = []time.Time{}
+		ct.failures[ip] = &FailRecord{}
 	}
-	ct.failures[ip] = append(ct.failures[ip], now)
-	filtered := ct.failures[ip][:0]
-	for _, t := range ct.failures[ip] {
-		if t.After(cutoff) {
-			filtered = append(filtered, t)
-		}
-	}
-	ct.failures[ip] = filtered
-	return len(ct.failures[ip])
+	r := ct.failures[ip]
+	r.times = append(r.times, now)
+	r.prune(cutoff)
+	return len(r.times)
 }
 
 func (ct *ConnectionTracker) RecordSuccess(ip string) {
@@ -949,7 +1014,11 @@ func (ct *ConnectionTracker) RecordSuccess(ip string) {
 func (ct *ConnectionTracker) ShouldFailover(ip string) bool {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
-	return len(ct.failures[ip]) >= FailoverThreshold
+	r := ct.failures[ip]
+	if r == nil {
+		return false
+	}
+	return len(r.times) >= FailoverThreshold
 }
 
 var (
@@ -962,17 +1031,60 @@ func newConnID() string {
 	return fmt.Sprintf("C%06d", n)
 }
 
+type PipeWorker struct {
+	src       net.Conn
+	dst       net.Conn
+	connID    string
+	mon       *PacketMonitor
+	evType    string
+	acc       *int64
+	onFirst   func()
+	closeOther net.Conn
+}
+
+func (pw *PipeWorker) run(wg *sync.WaitGroup) {
+	defer wg.Done()
+	bufPtr := bufPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer bufPool.Put(bufPtr)
+	first := true
+	for {
+		nr, err := pw.src.Read(buf)
+		if nr > 0 {
+			if _, wErr := pw.dst.Write(buf[:nr]); wErr != nil {
+				break
+			}
+			if first && pw.onFirst != nil {
+				pw.onFirst()
+				first = false
+			}
+			if pw.mon != nil && pw.acc != nil {
+				n64 := int64(nr)
+				prev := atomic.AddInt64(pw.acc, n64) - n64
+				if prev/DataLogInterval != (prev+n64)/DataLogInterval {
+					pw.mon.Emit(PacketEvent{Event: pw.evType, ConnID: pw.connID, Data: map[string]interface{}{"bytes": nr}})
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	pw.closeOther.Close()
+}
+
 type ProxyServer struct {
 	listenHost  string
 	listenPort  int
 	connectIP   string
-	connectPort int
+	connectPort string
 	fakeSNI     string
 	strategy    BypassStrategy
 	interfaceIP string
 	semaphore   chan struct{}
 	logger      *log.Logger
 	dialer      *net.Dialer
+	builder     ClientHelloBuilder
 }
 
 func NewProxyServer(listenHost string, listenPort int, connectIP string, connectPort int,
@@ -980,7 +1092,7 @@ func NewProxyServer(listenHost string, listenPort int, connectIP string, connect
 
 	d := &net.Dialer{
 		Timeout:   15 * time.Second,
-		KeepAlive: 60 * time.Second,
+		KeepAlive: 30 * time.Second,
 	}
 	if interfaceIP != "" {
 		d.LocalAddr = &net.TCPAddr{IP: net.ParseIP(interfaceIP)}
@@ -990,7 +1102,7 @@ func NewProxyServer(listenHost string, listenPort int, connectIP string, connect
 		listenHost:  listenHost,
 		listenPort:  listenPort,
 		connectIP:   connectIP,
-		connectPort: connectPort,
+		connectPort: fmt.Sprintf("%s:%d", connectIP, connectPort),
 		fakeSNI:     fakeSNI,
 		strategy:    strategy,
 		interfaceIP: interfaceIP,
@@ -1002,14 +1114,17 @@ func NewProxyServer(listenHost string, listenPort int, connectIP string, connect
 
 func (ps *ProxyServer) Start() error {
 	addr := fmt.Sprintf("%s:%d", ps.listenHost, ps.listenPort)
-
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
-
-	printRunningBanner(ps.listenHost, ps.listenPort, ps.connectIP, ps.connectPort,
+	printRunningBanner(ps.listenHost, ps.listenPort, ps.connectIP,
+		func() int {
+			var p int
+			fmt.Sscanf(ps.connectPort[strings.LastIndex(ps.connectPort, ":")+1:], "%d", &p)
+			return p
+		}(),
 		ps.fakeSNI, ps.strategy.Name())
 
 	for {
@@ -1024,8 +1139,8 @@ func (ps *ProxyServer) Start() error {
 		}
 		ps.semaphore <- struct{}{}
 		go func(c net.Conn) {
+			defer func() { <-ps.semaphore }()
 			ps.handleConnection(c)
-			<-ps.semaphore
 		}(conn)
 	}
 }
@@ -1034,7 +1149,7 @@ func (ps *ProxyServer) handleConnection(incoming net.Conn) {
 	mon := GetMonitor()
 	connID := newConnID()
 	clientStr := incoming.RemoteAddr().String()
-	serverStr := fmt.Sprintf("%s:%d", ps.connectIP, ps.connectPort)
+	serverStr := ps.connectPort
 
 	if mon != nil {
 		mon.Emit(PacketEvent{Event: EvConnOpen, ConnID: connID, Data: map[string]interface{}{
@@ -1065,8 +1180,7 @@ func (ps *ProxyServer) handleConnection(incoming net.Conn) {
 	bufPool.Put(bufPtr)
 	incoming.SetDeadline(time.Time{})
 
-	b := ClientHelloBuilder{}
-	parsed := b.ParseClientHello(firstData)
+	parsed := ps.builder.ParseClientHello(firstData)
 	clientSNI := ""
 	if s, ok := parsed["sni"].(string); ok {
 		clientSNI = s
@@ -1105,7 +1219,8 @@ func (ps *ProxyServer) handleConnection(incoming net.Conn) {
 		tc.SetReadBuffer(TCPReadBuffer)
 		tc.SetWriteBuffer(TCPWriteBuffer)
 		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(60 * time.Second)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+		tc.SetNoDelay(true)
 	}
 
 	success := ps.applyStrategyInstrumented(incoming, outgoing, firstData, connID, mon)
@@ -1125,60 +1240,35 @@ func (ps *ProxyServer) handleConnection(incoming net.Conn) {
 
 	wg.Add(2)
 
-	go func() {
-		defer wg.Done()
-		bufPtr := bufPool.Get().(*[]byte)
-		buf := *bufPtr
-		defer bufPool.Put(bufPtr)
-		for {
-			nr, err := incoming.Read(buf)
-			if nr > 0 {
-				if _, wErr := outgoing.Write(buf[:nr]); wErr != nil {
-					break
-				}
+	c2sWorker := &PipeWorker{
+		src:        incoming,
+		dst:        outgoing,
+		connID:     connID,
+		mon:        mon,
+		evType:     EvDataC2S,
+		acc:        &c2sAcc,
+		closeOther: outgoing,
+	}
+	s2cWorker := &PipeWorker{
+		src:        outgoing,
+		dst:        incoming,
+		connID:     connID,
+		mon:        mon,
+		evType:     EvDataS2C,
+		acc:        &s2cAcc,
+		closeOther: incoming,
+		onFirst: func() {
+			if atomic.CompareAndSwapInt32(&serverResponded, 0, 1) {
+				connTracker.RecordSuccess(ps.connectIP)
 				if mon != nil {
-					n64 := int64(nr)
-					if atomic.AddInt64(&c2sAcc, n64)%DataLogInterval < n64 {
-						mon.Emit(PacketEvent{Event: EvDataC2S, ConnID: connID, Data: map[string]interface{}{"bytes": nr}})
-					}
+					mon.Emit(PacketEvent{Event: EvServerResponse, ConnID: connID, Data: map[string]interface{}{"size": 0}})
 				}
 			}
-			if err != nil {
-				break
-			}
-		}
-		outgoing.Close()
-	}()
+		},
+	}
 
-	go func() {
-		defer wg.Done()
-		bufPtr := bufPool.Get().(*[]byte)
-		buf := *bufPtr
-		defer bufPool.Put(bufPtr)
-		for {
-			nr, err := outgoing.Read(buf)
-			if nr > 0 {
-				if _, wErr := incoming.Write(buf[:nr]); wErr != nil {
-					break
-				}
-				n64 := int64(nr)
-				if atomic.CompareAndSwapInt32(&serverResponded, 0, 1) {
-					connTracker.RecordSuccess(ps.connectIP)
-					if mon != nil {
-						mon.Emit(PacketEvent{Event: EvServerResponse, ConnID: connID, Data: map[string]interface{}{"size": nr}})
-					}
-				} else if mon != nil {
-					if atomic.AddInt64(&s2cAcc, n64)%DataLogInterval < n64 {
-						mon.Emit(PacketEvent{Event: EvDataS2C, ConnID: connID, Data: map[string]interface{}{"bytes": nr}})
-					}
-				}
-			}
-			if err != nil {
-				break
-			}
-		}
-		incoming.Close()
-	}()
+	go c2sWorker.run(&wg)
+	go s2cWorker.run(&wg)
 
 	wg.Wait()
 
@@ -1202,7 +1292,7 @@ func (ps *ProxyServer) applyStrategyInstrumented(
 	switch name {
 	case "fragment":
 		fs := ps.strategy.(*FragmentBypass)
-		fragments := fragmentClientHello(firstData, fs.strategy)
+		fragments := fs.engine.Fragment(firstData, fs.strategy)
 		if mon != nil {
 			sizes := make([]int, len(fragments))
 			for i, f := range fragments {
@@ -1263,7 +1353,7 @@ func (ps *ProxyServer) applyStrategyInstrumented(
 				}})
 			}
 		}
-		fragments := fragmentClientHello(firstData, cb.fragmentStrategy)
+		fragments := cb.engine.Fragment(firstData, cb.fragmentStrategy)
 		if mon != nil {
 			sizes := make([]int, len(fragments))
 			for i, f := range fragments {
@@ -1305,7 +1395,9 @@ const banner = `
  ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝    ╚══════╝╚═╝  ╚═══╝╚═╝
 `
 
-func loadConfig(path string) (map[string]interface{}, error) {
+type ConfigLoader struct{}
+
+func (ConfigLoader) Load(path string) (map[string]interface{}, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -1322,7 +1414,7 @@ func loadConfig(path string) (map[string]interface{}, error) {
 	return cfg, nil
 }
 
-func generateConfig(path string) error {
+func (ConfigLoader) Generate(path string) error {
 	data, err := json.MarshalIndent(defaultConfig, "", "  ")
 	if err != nil {
 		return err
@@ -1335,7 +1427,20 @@ func generateConfig(path string) error {
 	return nil
 }
 
-func buildStrategy(cfg map[string]interface{}) BypassStrategy {
+func (ConfigLoader) Merge(base, overlay map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{}, len(base))
+	for k, v := range base {
+		result[k] = v
+	}
+	for k, v := range overlay {
+		result[k] = v
+	}
+	return result
+}
+
+type StrategyFactory struct{}
+
+func (StrategyFactory) Build(cfg map[string]interface{}) BypassStrategy {
 	method := strings.ToLower(strMapVal(cfg, "BYPASS_METHOD", "fragment"))
 	fragStrategy := strMapVal(cfg, "FRAGMENT_STRATEGY", "sni_split")
 	fragDelay := floatMapVal(cfg, "FRAGMENT_DELAY", 0.1)
@@ -1355,7 +1460,13 @@ func buildStrategy(cfg map[string]interface{}) BypassStrategy {
 	return NewFragmentBypass("sni_split", 0.1, true)
 }
 
-func parseHostPort(addr, defaultHost string, defaultPort int) (string, int) {
+func buildStrategy(cfg map[string]interface{}) BypassStrategy {
+	return StrategyFactory{}.Build(cfg)
+}
+
+type AddressParser struct{}
+
+func (AddressParser) Parse(addr, defaultHost string, defaultPort int) (string, int) {
 	if addr == "" {
 		return defaultHost, defaultPort
 	}
@@ -1385,6 +1496,10 @@ func parseHostPort(addr, defaultHost string, defaultPort int) (string, int) {
 	return parts[0], defaultPort
 }
 
+func parseHostPort(addr, defaultHost string, defaultPort int) (string, int) {
+	return AddressParser{}.Parse(addr, defaultHost, defaultPort)
+}
+
 func resolveHost(host string) string {
 	addrs, err := net.LookupHost(host)
 	if err != nil || len(addrs) == 0 {
@@ -1406,7 +1521,9 @@ func getDefaultInterfaceIPv4(dest string) string {
 	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }
 
-func showPlatformInfo() {
+type PlatformInfo struct{}
+
+func (PlatformInfo) Show() {
 	w := 52
 	fmt.Printf("\n╭%s╮\n", strings.Repeat("─", w))
 	fmt.Printf("│%s│\n", centerPad(fmt.Sprintf("  Platform Info  —  v%s", Version), w))
@@ -1443,6 +1560,10 @@ func showPlatformInfo() {
 	fmt.Printf("  %s  Recommended methods:\n", bold("★"))
 	fmt.Printf("  %s   combined   — TTL trick + fragmentation %s\n", green("★"), dim("(best)"))
 	fmt.Printf("  %s   fragment   — fragmentation only\n", cyan("✓"))
+}
+
+func showPlatformInfo() {
+	PlatformInfo{}.Show()
 }
 
 func printHelpExtra() {
@@ -1735,8 +1856,10 @@ func main() {
 		return
 	}
 
+	loader := ConfigLoader{}
+
 	if *fGenerateConfig != "" {
-		if err := generateConfig(*fGenerateConfig); err != nil {
+		if err := loader.Generate(*fGenerateConfig); err != nil {
 			os.Exit(1)
 		}
 		return
@@ -1760,33 +1883,29 @@ func main() {
 	}
 
 	if *fConfig != "" {
-		userCfg, err := loadConfig(*fConfig)
-		if err == nil {
-			for k, v := range userCfg {
-				cfg[k] = v
-			}
+		if userCfg, err := loader.Load(*fConfig); err == nil {
+			cfg = loader.Merge(cfg, userCfg)
 		}
 	} else {
 		for _, candidate := range []string{"config.json", "snispf.json"} {
 			if _, err := os.Stat(candidate); err == nil {
-				userCfg, err := loadConfig(candidate)
-				if err == nil {
-					for k, v := range userCfg {
-						cfg[k] = v
-					}
+				if userCfg, err := loader.Load(candidate); err == nil {
+					cfg = loader.Merge(cfg, userCfg)
 					break
 				}
 			}
 		}
 	}
 
+	addrParser := AddressParser{}
+
 	if *fListen != "" {
-		h, p := parseHostPort(*fListen, "0.0.0.0", 40443)
+		h, p := addrParser.Parse(*fListen, "0.0.0.0", 40443)
 		cfg["LISTEN_HOST"] = h
 		cfg["LISTEN_PORT"] = float64(p)
 	}
 	if *fConnect != "" {
-		h, p := parseHostPort(*fConnect, "104.18.38.202", 443)
+		h, p := addrParser.Parse(*fConnect, "104.18.38.202", 443)
 		cfg["CONNECT_IP"] = h
 		cfg["CONNECT_PORT"] = float64(p)
 	}
@@ -1847,6 +1966,7 @@ func main() {
 		os.Exit(0)
 	}()
 
+	_ = mon
 	if err := server.Start(); err != nil {
 		os.Exit(1)
 	}
