@@ -7,7 +7,7 @@ https://t.me/rstasnispoof
 
 
 
-# RSTA SNI Spoof v3.0.0
+# RSTA SNI Spoof 
 
 ابزار دور زدن فیلترینگ با روش جعل SNI و فرگمنتیشن TLS  
 نوشته شده به زبان Go — بدون نیاز به روت — قابل اجرا روی Termux/Android/Linux
