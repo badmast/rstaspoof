@@ -1,6 +1,6 @@
 دوستان این پروژه به لطف پترنیهای عزیز پا برجاست.ایشون رو حمایت کنید.
 اینم نسخه اپن سورس اندروید:
-https://github.com/rstagit/androidspf
+https://github.com/rstagit/rstang
 
 گروه پروژه داخل تلگرام:
 https://t.me/rstasnispoof
